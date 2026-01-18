@@ -10,6 +10,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from sklearn.metrics.pairwise import euclidean_distances
+from scipy.spatial.distance import cdist # 导入 cdist 用于计算余弦距离
 
 import config
 from model import GNNGroupTracker
@@ -23,6 +24,7 @@ from trackers.cbmember import CBMeMBerTracker
 # 确保文件名是 trackers/graph_mb.py
 from trackers.graph_mb import GraphMBTracker 
 from trackers.gnn_processor import GNNPostProcessor
+#from trackers.gnn_processor_ukf import GNNPostProcessorUKF # 导入新的
 
 def run_evaluation():
     device = torch.device(config.DEVICE)
@@ -71,28 +73,54 @@ def run_evaluation():
             
             # --- 1. H-GAT-GT (Ours) ---
             t0 = time.time()
-            if gnn_model:
-                point_to_track_map_gnn = np.full(len(meas_points), -1)
-                pred_c_gnn, pred_id_gnn = [], []
-                if graph.edge_index.shape[1] > 0:
-                    graph_dev = graph.to(device)
-                    with torch.no_grad(): scores, offsets = gnn_model(graph_dev)
-                    mask = scores.cpu() > 0.5; edges = graph.edge_index.cpu()[:, mask].numpy()
-                    if edges.shape[1] > 0:
-                        adj = coo_matrix((np.ones(edges.shape[1]), (edges[0], edges[1])), shape=(graph.num_nodes, graph.num_nodes))
-                        _, labels = connected_components(adj, directed=False)
-                    else: labels = np.arange(graph.num_nodes)
-                    corrected_pos = meas_points + offsets.cpu().numpy()
-                    det_centers = []; cluster_map = {}
-                    for l in set(labels):
-                        if np.sum(labels == l) >= 3:
-                            cluster_map[len(det_centers)] = l
-                            det_centers.append(np.mean(corrected_pos[labels == l], axis=0))
-                    assignment = gnn_processor.update(det_centers)
-                    pred_c_gnn = [det_centers[d_idx] for d_idx in assignment.keys()]
-                    pred_id_gnn = list(assignment.values())
-                    for d_idx, t_id in assignment.items():
-                        l = cluster_map[d_idx]; point_indices = np.where(labels == l)[0]; point_to_track_map_gnn[point_indices] = t_id
+            pred_c_gnn, pred_id_gnn = np.array([]), np.array([]) # 默认返回值
+            point_to_track_map_gnn = np.full(len(meas_points), -1) # 默认返回值
+
+            if gnn_model and graph.edge_index.shape[1] > 0:
+                graph_dev = graph.to(device)
+                with torch.no_grad(): scores, offsets, node_embeddings = gnn_model(graph_dev)
+                node_embeddings = node_embeddings.cpu().numpy()
+                mask = scores.cpu() > 0.5; edges = graph.edge_index.cpu()[:, mask].numpy()
+                if edges.shape[1] > 0:
+                    adj = coo_matrix((np.ones(edges.shape[1]), (edges[0], edges[1])), shape=(graph.num_nodes, graph.num_nodes))
+                    _, labels = connected_components(adj, directed=False)
+                else: labels = np.arange(graph.num_nodes)
+
+                corrected_pos = meas_points + offsets.cpu().numpy()
+                
+                # --- 为每个检测到的群组提取质心和外观特征 ---
+                det_centers = []
+                det_features = []
+                det_point_sets = [] # <--- 新增
+
+                cluster_map = {}
+                for l in set(labels):
+                    if np.sum(labels == l) >= 3:
+                        indices = np.where(labels == l)[0]
+                        cluster_map[len(det_centers)] = l
+                        det_centers.append(np.mean(corrected_pos[indices], axis=0))
+                        # 计算并保存平均外观特征
+                        det_features.append(np.mean(node_embeddings[indices], axis=0))
+                        det_point_sets.append(indices) # <--- 新增：保存构成点的索引
+
+                det_centers = np.array(det_centers).reshape(-1, 2)
+                det_features = np.array(det_features)
+
+                # 调用跟踪器更新
+                pred_c_gnn, pred_id_gnn = gnn_processor.update(det_centers)
+
+                # 只有在 GNN 实际检测到群组时，才执行反向映射以计算聚类指标
+                if det_centers.shape[0] > 0 and len(pred_c_gnn) > 0:
+                    cost_final = euclidean_distances(pred_c_gnn, det_centers)
+                    r, c = linear_sum_assignment(cost_final)
+                    for r_i, c_i in zip(r,c):
+                        if cost_final[r_i, c_i] < 1.0:
+                            final_tid = pred_id_gnn[r_i]
+                            if c_i in cluster_map: # 再次检查以防万一
+                                original_cluster_label = cluster_map[c_i]
+                                point_indices = np.where(labels == original_cluster_label)[0]
+                                point_to_track_map_gnn[point_indices] = final_tid
+            
             t1 = time.time()
             metrics['H-GAT-GT (Ours)'].update_time(t1 - t0)
             metrics['H-GAT-GT (Ours)'].update(gt_centers, gt_ids, pred_c_gnn, pred_id_gnn)
