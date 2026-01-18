@@ -59,4 +59,4 @@ class GNNGroupTracker(nn.Module):
         # Offset Prediction
         pred_offsets = self.offset_regressor(h)
         
-        return edge_scores, pred_offsets
+        return edge_scores, pred_offsets, h
