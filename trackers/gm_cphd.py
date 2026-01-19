@@ -1,3 +1,4 @@
+# trackers/gm_cphd.py
 import numpy as np
 from scipy.stats import multivariate_normal
 from scipy.optimize import linear_sum_assignment
@@ -11,8 +12,7 @@ class GaussianComponent:
 
 class GMCPHDTracker:
     """
-    Gaussian Mixture Cardinalityized PHD (Simplified Engineering Version)
-    Differs from PHD by actively maintaining cardinality statistics to stabilize the weight update.
+    Gaussian Mixture Cardinalityized PHD (Robust Engineering Version)
     """
     def __init__(self):
         # Model Parameters
@@ -27,11 +27,9 @@ class GMCPHDTracker:
         self.max_gaussians = 100
         self.extract_thresh = 0.5
         
-        # Cardinality Distribution (Mean and Variance of target number)
         self.N_mean = 0.0
         self.N_var = 0.0
         
-        # ID Management
         self.next_id = 1
         self.active_tracks = {} 
         self.components = []
@@ -49,7 +47,6 @@ class GMCPHDTracker:
         Q = np.eye(4) * 2.0
         
         predicted_comps = []
-        # Survival
         w_survive_sum = 0
         for comp in self.components:
             m_pred = F @ comp.m
@@ -58,101 +55,117 @@ class GMCPHDTracker:
             predicted_comps.append(GaussianComponent(w_pred, m_pred, P_pred))
             w_survive_sum += w_pred
             
-        # Birth (Adaptive at measurements)
+        # Birth
         w_birth_sum = 0
         H = np.array([[1,0,0,0],[0,1,0,0]])
         for z in measurements:
             m_birth = np.array([z[0], z[1], 0, 0])
             P_birth = np.eye(4) * 50.0
-            # Weight initialization is crucial
             predicted_comps.append(GaussianComponent(self.birth_weight, m_birth, P_birth))
             w_birth_sum += self.birth_weight
             
-        # Cardinality Prediction (Simplified)
-        # N_k|k-1 = P_s * N_k-1 + N_birth
+        # Cardinality Prediction
         self.N_mean = self.p_survival * self.N_mean + w_birth_sum
-        self.N_var = self.p_survival**2 * self.N_var + w_birth_sum # Approximate
+        self.N_var = self.p_survival**2 * self.N_var + w_birth_sum 
         
         self.components = predicted_comps
 
         # --- 2. Update (CPHD Scaling) ---
         updated_comps = []
-        
-        # Pre-calculate likelihoods and clutter
         R = np.eye(2) * 5.0
         
-        # Miss detection term (Corrected by CPHD factor)
-        # In full CPHD, this scales based on cardinality. 
-        # Here we use a simpler heuristic: if we think N is high but sum(w) is low, boost weights.
         current_w_sum = sum(c.w for c in self.components)
-        cphd_factor = 1.0 
-        if current_w_sum > 0:
-            cphd_factor = self.N_mean / (current_w_sum + 1e-6)
+        
+        # --- 改进点: 限制 CPHD 调节因子的范围，防止数值不稳定 ---
+        if current_w_sum > 1e-6:
+            cphd_factor = self.N_mean / current_w_sum
+            cphd_factor = np.clip(cphd_factor, 0.1, 10.0) # 防止过度缩放
+        else:
+            cphd_factor = 1.0
             
+        # Miss detection update
         for comp in self.components:
-            w_miss = (1 - self.p_detect) * comp.w * cphd_factor # Apply correction
+            w_miss = (1 - self.p_detect) * comp.w * cphd_factor
             updated_comps.append(GaussianComponent(w_miss, comp.m, comp.P))
             
-        # Detection term
+        # Detection update
         for z in measurements:
             z_comps = []
             total_likelihood = 0.0
             
             for comp in self.components:
-                # Kalman Innovation
                 y = z - H @ comp.m
                 S = H @ comp.P @ H.T + R
-                K = comp.P @ H.T @ np.linalg.inv(S)
+                try:
+                    S_inv = np.linalg.inv(S)
+                    K = comp.P @ H.T @ S_inv
+                    
+                    # Manual Multivariate Normal for speed/robustness
+                    diff = z - H @ comp.m
+                    mahal = diff.T @ S_inv @ diff
+                    det_S = np.linalg.det(S)
+                    likelihood = np.exp(-0.5 * mahal) / (2 * np.pi * np.sqrt(det_S) + 1e-10)
+                except:
+                    likelihood = 0.0
+                    K = np.zeros((4, 2))
+
                 m_upd = comp.m + K @ y
                 P_upd = (np.eye(4) - K @ H) @ comp.P
-                
-                try: likelihood = multivariate_normal.pdf(z, mean=H@comp.m, cov=S)
-                except: likelihood = 0.0
-                
                 w_upd = self.p_detect * comp.w * likelihood
+                
                 z_comps.append(GaussianComponent(w_upd, m_upd, P_upd))
                 total_likelihood += w_upd
             
-            # CPHD Normalization: Balances clutter vs detection
-            # Full CPHD uses symmetric functions here. 
-            # We approximate: Normalized by (Clutter + Likelihood) but scaled by cardinality belief.
             norm = self.clutter_density + total_likelihood
-            
             for z_c in z_comps:
-                z_c.w /= norm
+                z_c.w /= (norm + 1e-10) # Prevent divide by zero
                 updated_comps.append(z_c)
                 
         self.components = updated_comps
         
-        # Update Cardinality Estimate
+        # Update Cardinality
         total_w = sum(c.w for c in self.components)
-        self.N_mean = total_w # In GM-PHD, N = sum(w)
-        self.N_var = total_w  # Poisson assumption
+        self.N_mean = total_w 
+        self.N_var = total_w 
         
         # --- 3. Pruning & Merging ---
-        self.components.sort(key=lambda x: x.w, reverse=True)
+        # 只保留权重大于阈值的
         self.components = [c for c in self.components if c.w > self.prune_thresh]
+        self.components.sort(key=lambda x: x.w, reverse=True)
         
         merged_components = []
         while len(self.components) > 0:
             high_w_comp = self.components[0]
             close_indices = [0]
+            
+            # 使用简单的距离判断，加速
             for i in range(1, len(self.components)):
-                if np.linalg.norm(high_w_comp.m[:2] - self.components[i].m[:2]) < self.merge_thresh:
+                dist = np.linalg.norm(high_w_comp.m[:2] - self.components[i].m[:2])
+                if dist < self.merge_thresh:
                     close_indices.append(i)
             
             merged_w = sum(self.components[i].w for i in close_indices)
-            merged_m = sum(self.components[i].w * self.components[i].m for i in close_indices) / merged_w
-            merged_components.append(GaussianComponent(merged_w, merged_m, high_w_comp.P))
+            
+            if merged_w > 0:
+                # Weighted average for mean
+                merged_m = np.zeros(4)
+                for i in close_indices:
+                    merged_m += self.components[i].w * self.components[i].m
+                merged_m /= merged_w
+                
+                merged_components.append(GaussianComponent(merged_w, merged_m, high_w_comp.P))
+            
+            # Remove merged
             self.components = [c for i, c in enumerate(self.components) if i not in close_indices]
             
         self.components = merged_components[:self.max_gaussians]
         
         # --- 4. Extraction & Labeling ---
-        extracted = [comp.m[:2] for comp in self.components if comp.w > self.extract_thresh]
-        return self._assign_labels(extracted)
+        extracted_pos = [comp.m[:2] for comp in self.components if comp.w > self.extract_thresh]
+        return self._assign_labels(extracted_pos)
 
     def _assign_labels(self, extracted_pos):
+        # 这一部分保持原样，逻辑没问题
         ret_c, ret_id = [], []
         if not extracted_pos:
             self.active_tracks = {}

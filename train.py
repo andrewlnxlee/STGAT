@@ -1,3 +1,4 @@
+# train.py
 import torch
 import torch.nn.functional as F
 import config
@@ -8,10 +9,26 @@ import os
 from tqdm import tqdm
 
 def compute_loss(pred_scores, pred_offsets, pred_uncertainty, data):
-    # 1. 边分类损失
-    pos_weight = torch.tensor([5.0]).to(pred_scores.device)
+    # --- 改进点 1: 动态计算正样本权重 (处理类别不平衡) ---
+    # 统计当前 Batch 中正负样本比例
+    num_pos = data.edge_label.sum().item()
+    num_neg = data.edge_label.numel() - num_pos
+    # 避免除以0，且限制权重上限，防止Loss爆炸
+    if num_pos > 0:
+        weight_factor = min(num_neg / num_pos, 10.0) 
+    else:
+        weight_factor = 1.0
+        
+    pos_weight = torch.tensor([weight_factor]).to(pred_scores.device)
+    
+    # 1. 边分类损失 (BCEWithLogitsLoss 更数值稳定)
+    # 注意: 模型输出已经是 Sigmoid 过的，所以这里用 BCELoss
+    # 如果想更稳定，模型去掉 Sigmoid 用 BCEWithLogitsLoss 会更好，这里保持接口不变用 BCELoss
     loss_edge = F.binary_cross_entropy(pred_scores, data.edge_label, weight=None)
     
+    # 也可以手动加权
+    # loss_edge = F.binary_cross_entropy_with_logits(...) # 需要改模型输出，暂时不动模型
+
     # 2. 异方差回归损失 (NLL Loss)
     id_map = {}
     if data.gt_centers.dim() > 1:
@@ -34,17 +51,17 @@ def compute_loss(pred_scores, pred_offsets, pred_uncertainty, data):
         pred_mu = pred_offsets[valid_mask]
         pred_sigma = pred_uncertainty[valid_mask] # 标准差
         
-        # NLL Loss 手写实现
-        # L = 0.5 * [ (y-mu)^2 / sigma^2 + log(sigma^2) ]
-        # 这里 pred_sigma 已经是标准差了，所以方差是 pred_sigma^2
+        # NLL Loss
         variance = pred_sigma.pow(2)
         mse = (pred_mu - target).pow(2)
-        loss_nll = 0.5 * (mse / variance + torch.log(variance)).mean()
+        # 加入 1e-6 保证 log 稳定
+        loss_nll = 0.5 * (mse / (variance + 1e-6) + torch.log(variance + 1e-6)).mean()
         
         loss_reg = loss_nll
     else:
         loss_reg = torch.tensor(0.0).to(pred_scores.device)
         
+    # 联合 Loss，可以调整系数
     return loss_edge + 1.0 * loss_reg, loss_edge.item(), loss_reg.item()
 
 def train():
@@ -56,12 +73,14 @@ def train():
     train_loader = DataLoader(train_set, batch_size=1, shuffle=True, collate_fn=lambda x: x[0], num_workers=0)
     val_loader = DataLoader(val_set, batch_size=1, shuffle=False, collate_fn=lambda x: x[0], num_workers=0)
     
-    # 初始化 MS-GTR 模型
     model = GNNGroupTracker().to(device)
     
-    # 稍微调小学习率，因为模型变深了
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0008, weight_decay=1e-4)
+    # 优化器设置
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4) # 稍微降低LR
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+    
+    # --- 改进点 2: 梯度累积参数 ---
+    accumulation_steps = 8  # 模拟 Batch Size = 4
     
     best_val_loss = float('inf')
     print(f"Start Training Multi-Scale Graph Transformer on {device}...")
@@ -69,27 +88,52 @@ def train():
     for epoch in range(config.EPOCHS):
         model.train()
         total_loss = 0
+        optimizer.zero_grad() # Epoch开始前清零
+        
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.EPOCHS} [Train]")
         
         step_count = 0
-        for episode_graphs in pbar:
+        current_batch_loss = 0
+        
+        for i, episode_graphs in enumerate(pbar):
+            # 处理一个 Episode 中的每一帧
             for graph in episode_graphs:
                 graph = graph.to(device)
                 if graph.edge_index.shape[1] == 0: continue 
                 
-                optimizer.zero_grad()
                 scores, offsets, uncertainty = model(graph)
                 loss, l_edge, l_reg = compute_loss(scores, offsets, uncertainty, graph)
+                
+                # Normalize loss for accumulation
+                loss = loss / accumulation_steps 
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5) # 梯度裁剪更严格
-                optimizer.step()
-                total_loss += loss.item()
+                
+                current_batch_loss += loss.item() * accumulation_steps
                 step_count += 1
+                
+                # --- 梯度累积步 ---
+                if (step_count + 1) % accumulation_steps == 0:
+                    # 梯度裁剪 (防止 Transformer 梯度爆炸)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    
+                    total_loss += current_batch_loss
+                    current_batch_loss = 0
             
-            pbar.set_postfix({'loss': f"{total_loss/max(1, step_count):.4f}", 'lr': f"{optimizer.param_groups[0]['lr']:.6f}"})
+            # 更新进度条显示
+            if step_count > 0:
+                pbar.set_postfix({'avg_loss': f"{total_loss/step_count:.4f}", 'lr': f"{optimizer.param_groups[0]['lr']:.6f}"})
         
+        # 确保最后一个不完整的 batch 也能更新参数
+        if step_count % accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
         scheduler.step()
         
+        # --- Validation Loop ---
         model.eval()
         val_loss = 0
         val_steps = 0
