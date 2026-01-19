@@ -68,7 +68,7 @@ class GNNGroupTracker(nn.Module):
         self.offset_regressor = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 2)
+            nn.Linear(hidden_dim, 4)
         )
 
     def forward(self, data):
@@ -116,5 +116,13 @@ class GNNGroupTracker(nn.Module):
         edge_scores = self.edge_classifier(edge_feat_cat).squeeze(-1)
         
         pred_offsets = self.offset_regressor(h_final)
+
+        # 偏移预测
+        out = self.offset_regressor(h_final)
         
-        return edge_scores, pred_offsets
+        pred_offsets = out[:, :2]   # 均值 (位置)
+        pred_uncertainty = out[:, 2:] # 不确定性 (log variance 或 raw sigma)
+        
+        # 使用 Softplus 保证方差为正，并加一个极小值 eps 防止除零
+        pred_uncertainty = F.softplus(pred_uncertainty) + 1e-6        
+        return edge_scores, pred_offsets, pred_uncertainty

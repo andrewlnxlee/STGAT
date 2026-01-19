@@ -7,12 +7,12 @@ from torch_geometric.loader import DataLoader
 import os
 from tqdm import tqdm
 
-def compute_loss(pred_scores, pred_offsets, data):
-    # 边分类损失
+def compute_loss(pred_scores, pred_offsets, pred_uncertainty, data):
+    # 1. 边分类损失
     pos_weight = torch.tensor([5.0]).to(pred_scores.device)
     loss_edge = F.binary_cross_entropy(pred_scores, data.edge_label, weight=None)
     
-    # 回归损失
+    # 2. 异方差回归损失 (NLL Loss)
     id_map = {}
     if data.gt_centers.dim() > 1:
         for row in data.gt_centers:
@@ -21,6 +21,7 @@ def compute_loss(pred_scores, pred_offsets, data):
             
     target_offsets = []
     valid_mask = []
+    
     for i, uid in enumerate(data.point_labels):
         uid = int(uid.item())
         if uid != 0 and uid in id_map:
@@ -29,10 +30,18 @@ def compute_loss(pred_scores, pred_offsets, data):
             valid_mask.append(i)
             
     if len(valid_mask) > 0:
-        target_tensor = torch.stack(target_offsets).to(pred_offsets.device)
-        pred_valid = pred_offsets[valid_mask]
-        # 使用 Huber Loss (Smooth L1)，比 MSE 对异常值更鲁棒
-        loss_reg = F.smooth_l1_loss(pred_valid, target_tensor)
+        target = torch.stack(target_offsets).to(pred_offsets.device)
+        pred_mu = pred_offsets[valid_mask]
+        pred_sigma = pred_uncertainty[valid_mask] # 标准差
+        
+        # NLL Loss 手写实现
+        # L = 0.5 * [ (y-mu)^2 / sigma^2 + log(sigma^2) ]
+        # 这里 pred_sigma 已经是标准差了，所以方差是 pred_sigma^2
+        variance = pred_sigma.pow(2)
+        mse = (pred_mu - target).pow(2)
+        loss_nll = 0.5 * (mse / variance + torch.log(variance)).mean()
+        
+        loss_reg = loss_nll
     else:
         loss_reg = torch.tensor(0.0).to(pred_scores.device)
         
@@ -69,8 +78,8 @@ def train():
                 if graph.edge_index.shape[1] == 0: continue 
                 
                 optimizer.zero_grad()
-                scores, offsets = model(graph)
-                loss, l_edge, l_reg = compute_loss(scores, offsets, graph)
+                scores, offsets, uncertainty = model(graph)
+                loss, l_edge, l_reg = compute_loss(scores, offsets, uncertainty, graph)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5) # 梯度裁剪更严格
                 optimizer.step()
@@ -89,8 +98,8 @@ def train():
                 for graph in episode_graphs:
                     graph = graph.to(device)
                     if graph.edge_index.shape[1] == 0: continue
-                    scores, offsets = model(graph)
-                    loss, _, _ = compute_loss(scores, offsets, graph)
+                    scores, offsets, uncertainty = model(graph)
+                    loss, _, _ = compute_loss(scores, offsets, uncertainty, graph)
                     val_loss += loss.item()
                     val_steps += 1
                     
