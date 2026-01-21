@@ -17,7 +17,7 @@ class TrackingMetrics:
         
         # --- MOTA / MOTP 相关 ---
         self.total_misses = 0
-        self.total_fps = 0  # False Positives
+        self.total_fps = 0  
         self.total_id_switches = 0
         self.total_gt_objects = 0
         self.total_dist_error = 0.0
@@ -36,12 +36,11 @@ class TrackingMetrics:
         self.total_completeness_score = 0.0
         self.total_points = 0
         
-        # --- 辅助 ---
         self.gt_id_map = {}
 
-        # --- 新增: G-IoU 相关 ---
-        self.total_iou = 0.0
-        self.iou_matches = 0  # 确保变量名一致
+        # --- G-IoU 相关 ---
+        self.total_giou = 0.0  # 改名更加明确
+        self.giou_matches = 0
 
     def update_time(self, seconds):
         self.total_time_sec += seconds
@@ -67,32 +66,51 @@ class TrackingMetrics:
             if len(pred_for_gt) > 0:
                 self.total_completeness_score += Counter(pred_for_gt).most_common(1)[0][1]
     
-    # 计算 IoU
-    def _compute_iou(self, box1, box2):
+    # --- 核心修改：实现真正的 Generalized IoU ---
+    def _compute_giou(self, box1, box2):
         # box: [cx, cy, w, h]
-        b1_x1, b1_y1 = box1[0] - box1[2]/2, box1[1] - box1[3]/2
-        b1_x2, b1_y2 = box1[0] + box1[2]/2, box1[1] + box1[3]/2
-        b2_x1, b2_y1 = box2[0] - box2[2]/2, box2[1] - box2[3]/2
-        b2_x2, b2_y2 = box2[0] + box2[2]/2, box2[1] + box2[3]/2
+        # 1. 转换坐标为左上角 (x1, y1) 和 右下角 (x2, y2)
+        b1_x1, b1_x2 = box1[0] - box1[2]/2, box1[0] + box1[2]/2
+        b1_y1, b1_y2 = box1[1] - box1[3]/2, box1[1] + box1[3]/2
+        
+        b2_x1, b2_x2 = box2[0] - box2[2]/2, box2[0] + box2[2]/2
+        b2_y1, b2_y2 = box2[1] - box2[3]/2, box2[1] + box2[3]/2
 
+        # 2. 计算交集 (Intersection)
         inter_x1 = max(b1_x1, b2_x1)
         inter_y1 = max(b1_y1, b2_y1)
         inter_x2 = min(b1_x2, b2_x2)
         inter_y2 = min(b1_y2, b2_y2)
 
-        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
-        b1_area = box1[2] * box1[3]
-        b2_area = box2[2] * box2[3]
-        
-        union_area = b1_area + b2_area - inter_area
-        if union_area <= 1e-6: return 0.0
-        return inter_area / union_area
+        if inter_x2 > inter_x1 and inter_y2 > inter_y1:
+            inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+        else:
+            inter_area = 0.0
 
-    # 更新函数
+        # 3. 计算并集 (Union)
+        b1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
+        b2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
+        union_area = b1_area + b2_area - inter_area + 1e-6 # 防止除零
+
+        iou = inter_area / union_area
+
+        # 4. 计算最小外接矩形 (Smallest Enclosing Box - C)
+        c_x1 = min(b1_x1, b2_x1)
+        c_y1 = min(b1_y1, b2_y1)
+        c_x2 = max(b1_x2, b2_x2)
+        c_y2 = max(b1_y2, b2_y2)
+        
+        c_area = (c_x2 - c_x1) * (c_y2 - c_y1) + 1e-6
+
+        # 5. G-IoU 公式: IoU - (C - Union) / C
+        giou = iou - (c_area - union_area) / c_area
+        
+        # 限制范围 [-1, 1]
+        return max(-1.0, min(1.0, giou))
+
     def update(self, gt_centers, gt_ids, pred_centers, pred_ids, gt_shapes=None, pred_shapes=None):
         self.total_frames += 1
         
-        # 格式化
         if not isinstance(gt_centers, np.ndarray) or gt_centers.ndim != 2: 
             gt_centers = np.array(gt_centers).reshape(-1, 2)
         if not isinstance(pred_centers, np.ndarray) or pred_centers.ndim != 2: 
@@ -101,7 +119,7 @@ class TrackingMetrics:
         num_gt = gt_centers.shape[0]
         num_pred = pred_centers.shape[0]
         
-        # 1. OSPA 计算
+        # OSPA 计算
         ospa, ospa_loc, ospa_card = self._compute_ospa_decomposed(gt_centers, pred_centers)
         self.total_ospa += ospa
         self.total_ospa_loc += ospa_loc
@@ -118,7 +136,7 @@ class TrackingMetrics:
             self.total_misses += num_gt
             return 
         
-        # 2. MOTA 匹配
+        # MOTA 匹配
         dist_matrix = euclidean_distances(gt_centers, pred_centers)
         row_ind, col_ind = linear_sum_assignment(dist_matrix)
         
@@ -136,7 +154,6 @@ class TrackingMetrics:
             self.total_dist_error += dist
             self.centroid_mse += dist**2
             
-            # ID Switch
             gt_id = gt_ids[r]
             track_id = pred_ids[c]
             
@@ -145,14 +162,17 @@ class TrackingMetrics:
                     self.total_id_switches += 1
             self.gt_id_map[gt_id] = track_id
             
-            # 3. G-IoU 计算
+            # --- G-IoU 计算 ---
+            # 只有当形状信息可用时才计算
             if gt_shapes is not None and pred_shapes is not None:
+                # 确保索引不越界 (防御性编程)
                 if r < len(gt_shapes) and c < len(pred_shapes):
+                    # 构造 [cx, cy, w, h]
                     gt_box = [gt_centers[r][0], gt_centers[r][1], gt_shapes[r][0], gt_shapes[r][1]]
                     pred_box = [pred_centers[c][0], pred_centers[c][1], pred_shapes[c][0], pred_shapes[c][1]]
                     
-                    self.total_iou += self._compute_iou(gt_box, pred_box)
-                    self.iou_matches += 1
+                    self.total_giou += self._compute_giou(gt_box, pred_box)
+                    self.giou_matches += 1
 
     def _compute_ospa_decomposed(self, gt, pred):
         m, n = gt.shape[0], pred.shape[0]
@@ -175,7 +195,6 @@ class TrackingMetrics:
         matches = max(1, self.total_matches)
         points = max(1, self.total_points)
         
-        # 计算所有指标
         mota = 1.0 - (self.total_misses + self.total_fps + self.total_id_switches) / gt_objs
         motp = self.total_dist_error / matches if matches > 0 else 0.0
         
@@ -189,7 +208,8 @@ class TrackingMetrics:
             "IDSW": self.total_id_switches,
             "FAR": self.total_fps / frames,
             "Count Err": self.cardinality_error / max(1, self.cardinality_samples),
-            "G-IoU": self.total_iou / max(1, self.iou_matches),
+            # G-IoU 是 [-1, 1] 的值，数值越大越好
+            "G-IoU": self.total_giou / max(1, self.giou_matches),
             "Purity": self.total_purity_score / points,
             "Comp": self.total_completeness_score / points,
             "Time": (self.total_time_sec / frames) * 1000

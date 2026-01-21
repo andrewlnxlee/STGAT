@@ -1,4 +1,4 @@
-# evaluate.py (已修复)
+# evaluate.py (Final Fix for G-IoU)
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -38,14 +38,16 @@ def run_evaluation():
     else: gnn_model = None
 
     # Instantiate Trackers
-    # ... (这部分不变) ...
     baseline_tracker = BaselineTracker(eps=35, min_samples=3)
     gm_cphd_tracker = GMCPHDTracker()
     cbmember_tracker = CBMeMBerTracker()
     graph_mb_tracker = GraphMBTracker()
+    
     metrics = {
-        'Baseline (DBSCAN+KF)': TrackingMetrics(), 'GM-CPHD (Standard)': TrackingMetrics(),
-        'CBMeMBer (Standard)': TrackingMetrics(), 'Graph-MB (Paper)': TrackingMetrics(),
+        'Baseline (DBSCAN+KF)': TrackingMetrics(),
+        'GM-CPHD (Standard)': TrackingMetrics(),
+        'CBMeMBer (Standard)': TrackingMetrics(),
+        'Graph-MB (Paper)': TrackingMetrics(),
         'H-GAT-GT (Ours)': TrackingMetrics()
     }
     
@@ -53,7 +55,7 @@ def run_evaluation():
     for episode_idx in tqdm(range(len(test_set))):
         episode_graphs = test_set.get(episode_idx)
         
-        # Reset trackers
+        # Reset Trackers
         gnn_processor = GNNPostProcessor()
         baseline_tracker.reset(); gm_cphd_tracker.reset(); cbmember_tracker.reset(); graph_mb_tracker.reset()
         
@@ -72,10 +74,14 @@ def run_evaluation():
             if gnn_model:
                 graph_dev = graph.to(device)
                 with torch.no_grad():
-                    # 确保模型输出对应
-                    model_output = gnn_model(graph_dev)
-                    scores, offsets, uncertainty = model_output[0], model_output[1], model_output[2]
+                    # 确保模型输出解包正确
+                    out = gnn_model(graph_dev)
+                    if isinstance(out, tuple):
+                        scores, offsets, uncertainty = out[0], out[1], out[2]
+                    else: # 兼容旧模型返回
+                        scores, offsets = out[0], out[1]
                 
+                # 修正后的坐标用于聚类和定位
                 corrected_pos = meas_points + offsets.cpu().numpy()
                 
                 labels = np.array([])
@@ -92,17 +98,19 @@ def run_evaluation():
                         indices = np.where(labels == l)[0]
                         cluster_indices_list.append(indices)
                         
+                        # 1. 质心：使用 GNN 修正后的点 (更准)
                         det_centers.append(np.mean(corrected_pos[indices], axis=0))
                         
-                        # --- FIX 2: 使用百分位数计算形状，抵抗离群点 ---
-                        pts = corrected_pos[indices]
-                        if len(pts) > 1:
-                            lower = np.percentile(pts, 5, axis=0)
-                            upper = np.percentile(pts, 95, axis=0)
+                        # 2. 形状：必须使用【原始测量点】(保持真实物理尺寸)
+                        # --- 关键修复：用 meas_points 而不是 corrected_pos ---
+                        pts_raw = meas_points[indices] 
+                        if len(pts_raw) > 1:
+                            lower = np.percentile(pts_raw, 5, axis=0)
+                            upper = np.percentile(pts_raw, 95, axis=0)
                             wh = upper - lower
                         else:
                             wh = np.array([0., 0.])
-                        det_shapes.append(np.maximum(wh, 3.0)) # 保底 3m 宽高
+                        det_shapes.append(np.maximum(wh, 3.0)) # 保底 3m
 
                 det_centers = np.array(det_centers).reshape(-1, 2)
                 det_shapes = np.array(det_shapes).reshape(-1, 2)
@@ -114,14 +122,11 @@ def run_evaluation():
                 else:
                     pred_c_gnn, pred_id_gnn, pred_shapes_gnn = gnn_processor.update(np.empty((0, 2)), None)
 
-                # --- FIX 1: 使用匈牙利匹配重建点云到Track的映射 ---
+                # 重建点云映射 (用于 Purity/Comp)
                 if len(pred_c_gnn) > 0 and len(det_centers) > 0:
-                    # 稳健地将 tracker 输出的中心点匹配回 DBSCAN 检测出的中心点
                     cost_matrix = euclidean_distances(pred_c_gnn, det_centers)
                     row_ind, col_ind = linear_sum_assignment(cost_matrix)
-                    
                     for r, c in zip(row_ind, col_ind):
-                        # 使用一个更合理的阈值，比如 20.0 米
                         if cost_matrix[r, c] < 20.0:
                             track_id = pred_id_gnn[r]
                             point_indices = cluster_indices_list[c]
@@ -130,7 +135,7 @@ def run_evaluation():
             t1 = time.time()
             metrics['H-GAT-GT (Ours)'].update_time(t1 - t0)
             
-            # GT Shapes (也使用百分位数，保持一致性)
+            # GT Shapes (保持一致，使用百分位数)
             gt_shapes_list = []
             pt_lbl = graph.point_labels.cpu().numpy()
             for gid in gt_ids:
@@ -146,12 +151,9 @@ def run_evaluation():
 
             metrics['H-GAT-GT (Ours)'].update(gt_centers, gt_ids, pred_c_gnn, pred_id_gnn, 
                                               gt_shapes=gt_shapes_arr, pred_shapes=pred_shapes_gnn)
-            # 传递修复后的 point_to_track_map_gnn
             metrics['H-GAT-GT (Ours)'].update_clustering_metrics(graph.point_labels.cpu().numpy(), point_to_track_map_gnn)
 
-
-            # --- 其他算法部分保持不变 ---
-            # ... (代码省略) ...
+            # --- Pre-process for Baselines ---
             t_pre = time.time()
             if len(meas_points) > 0:
                 db_labels = DBSCAN(eps=35, min_samples=3).fit_predict(meas_points)
@@ -209,15 +211,44 @@ def run_evaluation():
             metrics['Graph-MB (Paper)'].update_time(t1 - t0)
             metrics['Graph-MB (Paper)'].update(gt_centers, gt_ids, gmb_c, gmb_id)
             metrics['Graph-MB (Paper)'].update_clustering_metrics(graph.point_labels.cpu().numpy(), gmb_pt_lbl)
-    
-    # ... (结果输出和绘图部分不变) ...
+
     final_res = {k: v.compute() for k, v in metrics.items()}
     df = pd.DataFrame(final_res).T
     cols = ['MOTA', 'MOTP','IDSW', 'FAR', 'OSPA (Total)', 'OSPA (Loc)', 'OSPA (Card)', 
             'RMSE (Pos)', 'Count Err', 'Purity', 'Completeness','G-IoU', 'Time','Comp',]
     df = df[[c for c in cols if c in df.columns]]
-    print("\n" + "="*100); print("FINAL 5-WAY COMPARISON RESULTS"); print("="*100)
-    print(df.to_string()); print("="*100)
+    
+    print("\n" + "="*100)
+    print("FINAL 5-WAY COMPARISON RESULTS")
+    print("="*100)
+    print(df.to_string())
+    print("="*100)
+    
+    # Save Plot
+    plot_cats = ['MOTA', 'OSPA (Total)', 'RMSE (Pos)', 'Count Err', 'Time']
+    x = np.arange(len(plot_cats))
+    width = 0.15 
+    fig, ax = plt.subplots(figsize=(18, 8))
+    trackers = ['Baseline (DBSCAN+KF)', 'GM-CPHD (Standard)', 'CBMeMBer (Standard)', 'Graph-MB (Paper)', 'H-GAT-GT (Ours)']
+    
+    for i, trk_name in enumerate(trackers):
+        vals = [final_res[trk_name].get(c, 0) for c in plot_cats]
+        viz_vals = []
+        for v, cat in zip(vals, plot_cats):
+            if cat in ['OSPA (Total)', 'RMSE (Pos)', 'Count Err', 'Time']: viz_vals.append(-v)
+            else: viz_vals.append(v)
+            
+        rects = ax.bar(x + (i - 2) * width, viz_vals, width, label=trk_name)
+        for rect, v in zip(rects, vals):
+            height = rect.get_height()
+            ax.annotate(f'{v:.2f}', xy=(rect.get_x() + rect.get_width()/2, height),
+                        xytext=(0, 3 if height >=0 else -15), textcoords="offset points", ha='center', va='bottom', fontsize=8)
+
+    ax.set_ylabel('Score (Higher is Better / Negative is Cost)')
+    ax.set_title('Comprehensive 5-Way Benchmark')
+    ax.set_xticks(x); ax.set_xticklabels(plot_cats); ax.legend()
+    plt.tight_layout()
+    plt.savefig("final_benchmark_5way.png")
 
 if __name__ == "__main__":
     run_evaluation()
