@@ -160,4 +160,4 @@ class GNNGroupTracker(nn.Module):
         pred_offsets = out[:, :2]   
         pred_uncertainty = F.softplus(out[:, 2:]) + 1e-6 # 保证方差为正
         
-        return edge_scores, pred_offsets, pred_uncertainty
+        return edge_scores, pred_offsets, pred_uncertainty, h_final

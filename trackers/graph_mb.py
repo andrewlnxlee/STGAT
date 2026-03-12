@@ -11,10 +11,10 @@ N_DIM = 5; ALPHA = 0.1; BETA = 2.0; KAPPA = 0.0
 LAMBDA = ALPHA**2 * (N_DIM + KAPPA) - N_DIM
 
 # --- Tracker Parameters ---
-PARENT_SEARCH_RADIUS = 50.0 
-Q_PROCESS_BASE = np.diag([2.0, 2.0, 5.0, 5.0, 1e-3]) 
-Q_COLLAB = np.diag([10.0, 10.0, 5.0, 5.0, 1e-4]) 
-GROUP_ASSOCIATION_THRESH = 150.0 
+PARENT_SEARCH_RADIUS = 60.0 # 扩大父节点搜索范围
+Q_PROCESS_BASE = np.diag([1.0, 1.0, 3.0, 3.0, 1e-3]) # 降低基础过程噪声
+Q_COLLAB = np.diag([5.0, 5.0, 3.0, 3.0, 1e-4]) # 降低协作噪声
+GROUP_ASSOCIATION_THRESH = 180.0 # 放宽组关联门限
 
 # ======================================================
 # Helper Classes & Functions
@@ -23,11 +23,11 @@ class GroupKalmanFilter:
     """A simple KF for tracking group centroids to stabilize ID association."""
     def __init__(self, pos):
         self.x = np.array([pos[0], pos[1], 0, 0])
-        self.P = np.eye(4) * 50.0
+        self.P = np.eye(4) * 20.0 # 初始协方差小一点，更信任初始位置
         self.F = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]])
         self.H = np.array([[1,0,0,0],[0,1,0,0]])
-        self.R = np.eye(2) * 25.0 # Assume high measurement noise for centroids
-        self.Q = np.eye(4) * 4.0
+        self.R = np.eye(2) * 5.0 # 降低测量噪声，相信更新的位置
+        self.Q = np.eye(4) * 2.0 # 降低过程噪声
 
     def predict(self):
         self.x = self.F @ self.x
@@ -71,12 +71,12 @@ class GraphMBTracker:
     def __init__(self):
         self.p_survival, self.p_detect = 0.99, 0.98
         self.clutter_density = 1e-5; self.dt = 1.0 
-        self.confirm_thresh = 0.70 # 回调到更稳健的阈值
-        self.prune_thresh = 0.01; self.max_components = 100
+        self.confirm_thresh = 0.40 # 进一步降低确认门限，让目标更容易保持
+        self.prune_thresh = 0.001; self.max_components = 200 # 减少剪枝，保留更多可能性
         self.tracks = []; self.next_point_id = 1
         self.next_group_id = 1; self.active_groups = {}
         self.wm, self.wc = get_weights()
-        self.cluster_model = DBSCAN(eps=35, min_samples=2)
+        self.cluster_model = DBSCAN(eps=45, min_samples=1) # 进一步放宽聚类，容忍大噪声
 
     def reset(self):
         self.tracks, self.active_groups = [], {}
@@ -162,13 +162,15 @@ class GraphMBTracker:
             except np.linalg.LinAlgError: continue
             for m_idx, z in enumerate(measurements):
                 diff = z - z_pred; mahal_dist_sq = diff.T @ S_inv @ diff
-                if mahal_dist_sq < 16.0: cost_matrix[t_idx, m_idx] = 0.5 * (mahal_dist_sq + np.log(det_S) + 2 * np.log(2 * np.pi))
+                # 放宽马氏距离门限 (16.0 -> 36.0)，对应大约 3-sigma 到 6-sigma，极大提高容错率
+                if mahal_dist_sq < 36.0: cost_matrix[t_idx, m_idx] = 0.5 * (mahal_dist_sq + np.log(det_S) + 2 * np.log(2 * np.pi))
 
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         assigned_tracks, assigned_meas = set(), set()
         
         for r, c in zip(row_ind, col_ind):
-            if cost_matrix[r, c] > 20.0: continue
+            # 同样放宽截断门限 (20.0 -> 50.0)
+            if cost_matrix[r, c] > 50.0: continue
             trk = self.tracks[r]; z = measurements[c]; z_pred, S, P_xz = track_predictions[r]
             K = P_xz @ np.linalg.inv(S); trk.m += K @ (z - z_pred); trk.P -= K @ S @ K.T
             trk.P = (trk.P + trk.P.T) / 2.0

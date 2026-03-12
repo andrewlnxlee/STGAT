@@ -101,7 +101,7 @@ def train():
                 graph = graph.to(device)
                 if graph.edge_index.shape[1] == 0: continue 
                 
-                scores, offsets, uncertainty = model(graph)
+                scores, offsets, uncertainty, _ = model(graph)
                 loss, l_edge, l_reg = compute_loss(scores, offsets, uncertainty, graph)
                 
                 # Normalize loss for accumulation
@@ -142,7 +142,7 @@ def train():
                 for graph in episode_graphs:
                     graph = graph.to(device)
                     if graph.edge_index.shape[1] == 0: continue
-                    scores, offsets, uncertainty = model(graph)
+                    scores, offsets, uncertainty, _ = model(graph)
                     loss, _, _ = compute_loss(scores, offsets, uncertainty, graph)
                     val_loss += loss.item()
                     val_steps += 1

@@ -20,3 +20,7 @@ LEARNING_RATE = 0.001
 EPOCHS = 50
 MODEL_SAVE_PATH = "best_model_v4.pth"
 DEVICE = "cuda"   # 或 "cpu"
+
+# --- 坐标转换 (用于 ETH/Hotel 数据集) ---
+COORD_SCALE = 50.0       # 缩放倍数
+COORD_OFFSET = [500.0, 500.0]  # 中心偏移 (x, y)
